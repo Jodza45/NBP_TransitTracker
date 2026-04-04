@@ -1,0 +1,414 @@
+﻿import { useEffect, useMemo, useRef, useState } from 'react'
+import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from 'react-leaflet'
+import { Icon, Marker as LeafletMarker } from 'leaflet'
+import type { LeafletEvent, LeafletMouseEvent } from 'leaflet'
+import './App.css'
+
+type LatLng = {
+  lat: number
+  lng: number
+}
+
+type Station = {
+  id: string
+  name: string
+  latitude: number
+  longitude: number
+}
+
+type NearbyStation = Station & {
+  distanceMeters: number
+}
+
+type StationArrival = {
+  vehicleId: string
+  lineId: string
+  estimatedSeconds: number
+}
+
+type StationArrivalsResponse = {
+  stationId: string
+  stationName: string
+  arrivals: StationArrival[]
+}
+
+const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:5000'
+const nisCenter: LatLng = { lat: 43.3209, lng: 21.8958 }
+const nisBounds: [[number, number], [number, number]] = [
+  [43.255, 21.78],
+  [43.39, 22.02],
+]
+const minStationsRadiusMeters = 500
+const maxStationsRadiusMeters = 5000
+const cyrToLatMap: Record<string, string> = {
+  А: 'A', а: 'a', Б: 'B', б: 'b', В: 'V', в: 'v', Г: 'G', г: 'g', Д: 'D', д: 'd',
+  Ђ: 'Dj', ђ: 'dj', Е: 'E', е: 'e', Ж: 'Z', ж: 'z', З: 'Z', з: 'z', И: 'I', и: 'i',
+  Ј: 'J', ј: 'j', К: 'K', к: 'k', Л: 'L', л: 'l', Љ: 'Lj', љ: 'lj', М: 'M', м: 'm',
+  Н: 'N', н: 'n', Њ: 'Nj', њ: 'nj', О: 'O', о: 'o', П: 'P', п: 'p', Р: 'R', р: 'r',
+  С: 'S', с: 's', Т: 'T', т: 't', Ћ: 'C', ћ: 'c', У: 'U', у: 'u', Ф: 'F', ф: 'f',
+  Х: 'H', х: 'h', Ц: 'C', ц: 'c', Ч: 'C', ч: 'c', Џ: 'Dz', џ: 'dz', Ш: 'S', ш: 's',
+}
+
+function toLatin(text: string): string {
+  return Array.from(text).map((ch) => cyrToLatMap[ch] ?? ch).join('')
+}
+
+function svgDataUri(svg: string): string {
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
+}
+
+const stationIcon = new Icon({
+  iconUrl: svgDataUri(`<svg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 34 34'>
+  <circle cx='17' cy='17' r='16' fill='white' stroke='#356ea8' stroke-width='2'/>
+  <circle cx='17' cy='17' r='11' fill='#4f89c4'/>
+  <rect x='10' y='12' width='14' height='10' rx='2' fill='white'/>
+  <circle cx='13' cy='23' r='1.6' fill='white'/>
+  <circle cx='21' cy='23' r='1.6' fill='white'/>
+  </svg>`),
+  iconSize: [36, 36],
+  iconAnchor: [18, 18],
+  popupAnchor: [0, -16],
+})
+
+const selectedIcon = new Icon({
+  iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png',
+  shadowUrl: 'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/images/marker-shadow.png',
+  iconSize: [25, 41],
+  iconAnchor: [12, 41],
+})
+
+function clampToNis(position: LatLng): LatLng {
+  const [[minLat, minLng], [maxLat, maxLng]] = nisBounds
+  return {
+    lat: Math.max(minLat, Math.min(maxLat, position.lat)),
+    lng: Math.max(minLng, Math.min(maxLng, position.lng)),
+  }
+}
+
+function toRadians(value: number): number {
+  return (value * Math.PI) / 180
+}
+
+function distanceMeters(from: LatLng, to: LatLng): number {
+  const earthRadius = 6371000
+  const dLat = toRadians(to.lat - from.lat)
+  const dLng = toRadians(to.lng - from.lng)
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRadians(from.lat)) * Math.cos(toRadians(to.lat)) * Math.sin(dLng / 2) * Math.sin(dLng / 2)
+
+  return earthRadius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+function RecenterOnSelection({ position }: { position: LatLng }) {
+  const map = useMap()
+
+  useEffect(() => {
+    map.setView([position.lat, position.lng])
+  }, [position, map])
+
+  return null
+}
+
+function ClickToPlaceMarker({ onPick }: { onPick: (position: LatLng) => void }) {
+  useMapEvents({
+    click: (event: LeafletMouseEvent) => {
+      onPick(clampToNis({ lat: event.latlng.lat, lng: event.latlng.lng }))
+    },
+  })
+
+  return null
+}
+
+function App() {
+  const [selectedPosition, setSelectedPosition] = useState<LatLng>(nisCenter)
+  const [allStations, setAllStations] = useState<Station[]>([])
+  const [selectedStation, setSelectedStation] = useState<NearbyStation | null>(null)
+  const [stationArrivals, setStationArrivals] = useState<StationArrivalsResponse | null>(null)
+  const [isLoadingStations, setIsLoadingStations] = useState(false)
+  const [isLoadingArrivals, setIsLoadingArrivals] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [searchTerm, setSearchTerm] = useState('')
+  const [isStationsReady, setIsStationsReady] = useState(false)
+  const [stationsRadiusMeters, setStationsRadiusMeters] = useState(minStationsRadiusMeters)
+  const hasInitialized = useRef(false)
+  const hasAutoLocated = useRef(false)
+
+  const nearbyStations = useMemo(() => {
+    return allStations
+      .map((station) => ({
+        ...station,
+        distanceMeters: distanceMeters(selectedPosition, { lat: station.latitude, lng: station.longitude }),
+      }))
+      .filter((station) => station.distanceMeters <= stationsRadiusMeters)
+      .sort((a, b) => a.distanceMeters - b.distanceMeters)
+  }, [allStations, selectedPosition, stationsRadiusMeters])
+
+  const filteredStations = useMemo(() => {
+    if (!searchTerm.trim()) {
+      return nearbyStations
+    }
+
+    const normalizedSearch = toLatin(searchTerm).toLowerCase()
+    return nearbyStations.filter((station) => toLatin(station.name).toLowerCase().includes(normalizedSearch))
+  }, [nearbyStations, searchTerm])
+
+  useEffect(() => {
+    if (hasInitialized.current) {
+      return
+    }
+
+    hasInitialized.current = true
+
+    const initializeStations = async () => {
+      setIsLoadingStations(true)
+      setError(null)
+
+      try {
+        await fetch(`${apiBaseUrl}/api/v1/stations/import-osm-nis`, { method: 'POST' }).catch(() => undefined)
+
+        const allEndpoints = [
+          `${apiBaseUrl}/api/v1/stations/all`,
+          `${apiBaseUrl}/api/stations/all`,
+        ]
+
+        let stations: Station[] = []
+
+        for (const endpoint of allEndpoints) {
+          const response = await fetch(endpoint)
+          if (!response.ok) {
+            continue
+          }
+
+          const data = (await response.json()) as Station[]
+          if (data.length > 0) {
+            stations = data
+            break
+          }
+        }
+
+        if (stations.length === 0) {
+          const nearbyResponse = await fetch(
+            `${apiBaseUrl}/api/v1/stations/nearby?lat=${nisCenter.lat}&lng=${nisCenter.lng}&radius=12000`,
+          )
+
+          if (nearbyResponse.ok) {
+            const nearby = (await nearbyResponse.json()) as NearbyStation[]
+            stations = nearby.map((x) => ({
+              id: x.id,
+              name: x.name,
+              latitude: x.latitude,
+              longitude: x.longitude,
+            }))
+          }
+        }
+
+        if (stations.length === 0) {
+          throw new Error('Failed to load stations.')
+        }
+
+        setAllStations(stations.map((station) => ({ ...station, name: toLatin(station.name) })))
+      } catch {
+        setError('Nis stations could not be loaded right now.')
+      } finally {
+        setIsLoadingStations(false)
+        setIsStationsReady(true)
+      }
+    }
+
+    void initializeStations()
+  }, [])
+
+  function locateMe() {
+    if (!navigator.geolocation) {
+      setError('Geolocation is not supported in this browser.')
+      return
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const next = clampToNis({
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+        })
+        setSelectedPosition(next)
+        setError(null)
+      },
+      () => {
+        setError('Location access denied or unavailable.')
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 10000 },
+    )
+  }
+
+  useEffect(() => {
+    if (hasAutoLocated.current) {
+      return
+    }
+
+    hasAutoLocated.current = true
+    locateMe()
+  }, [])
+
+  const selectStation = async (station: NearbyStation) => {
+    setSelectedStation(station)
+    setIsLoadingArrivals(true)
+    setError(null)
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/v1/stations/${station.id}/arrivals`)
+      if (!response.ok) {
+        throw new Error('Failed to load arrivals.')
+      }
+
+      const data = (await response.json()) as StationArrivalsResponse
+      setStationArrivals(data)
+    } catch {
+      setError('Could not load arrivals for this station yet.')
+      setStationArrivals(null)
+    } finally {
+      setIsLoadingArrivals(false)
+    }
+  }
+
+  return (
+    <div className="layout">
+      <header className="topbar">
+        <input
+          className="search"
+          type="text"
+          placeholder="Search Nis stations"
+          value={searchTerm}
+          onChange={(event) => setSearchTerm(event.target.value)}
+        />
+      </header>
+
+      <main className="map-wrap">
+        <MapContainer
+          center={[selectedPosition.lat, selectedPosition.lng]}
+          zoom={15}
+          minZoom={12}
+          maxZoom={18}
+          maxBounds={nisBounds}
+          maxBoundsViscosity={1}
+          scrollWheelZoom
+          className="map"
+        >
+          <TileLayer
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          />
+
+          <RecenterOnSelection position={selectedPosition} />
+          <ClickToPlaceMarker onPick={setSelectedPosition} />
+
+          <Marker
+            position={[selectedPosition.lat, selectedPosition.lng]}
+            icon={selectedIcon}
+            draggable
+            eventHandlers={{
+              dragend: (event: LeafletEvent) => {
+                const marker = event.target as LeafletMarker
+                const latLng = marker.getLatLng()
+                setSelectedPosition(clampToNis({ lat: latLng.lat, lng: latLng.lng }))
+              },
+            }}
+          >
+            <Popup>Your selected Nis position</Popup>
+          </Marker>
+
+          {filteredStations.map((station) => (
+            <Marker
+              key={station.id}
+              position={[station.latitude, station.longitude]}
+              icon={stationIcon}
+              eventHandlers={{ click: () => void selectStation(station) }}
+            >
+              <Popup>
+                <strong>{station.name}</strong>
+                <br />
+                {Math.round(station.distanceMeters)} m away
+              </Popup>
+            </Marker>
+          ))}
+        </MapContainer>
+
+        <button className="locate-fab" onClick={locateMe} aria-label="Use my location" title="Use my location">
+          <svg viewBox="0 0 24 24" role="img" aria-hidden="true">
+            <path d="M21.2 2.8a1 1 0 0 0-1.05-.24L3.55 9.02a1 1 0 0 0 .1 1.9l7.12 2.06 2.06 7.12a1 1 0 0 0 1.9.1l6.46-16.6a1 1 0 0 0-.24-1.05ZM13.34 17.2l-1.5-5.2a1 1 0 0 0-.68-.68l-5.2-1.5 11.55-4.5-4.17 11.88Z" />
+          </svg>
+        </button>
+      </main>
+
+      <aside className="bottom-sheet">
+        {error ? <p className="error">{error}</p> : null}
+
+        {!selectedStation ? (
+          <section>
+            <div className="range-row">
+              <h2>Nearby Stations ({filteredStations.length})</h2>
+              <div className="range-control">
+                <label htmlFor="rangeMeters">Range: {stationsRadiusMeters >= 1000 ? `${(stationsRadiusMeters / 1000).toFixed(1)} km` : `${stationsRadiusMeters} m`}</label>
+                <input
+                  id="rangeMeters"
+                  type="range"
+                  min={minStationsRadiusMeters}
+                  max={maxStationsRadiusMeters}
+                  step={100}
+                  value={stationsRadiusMeters}
+                  onChange={(event) => setStationsRadiusMeters(Number(event.target.value))}
+                />
+              </div>
+            </div>
+            {!isStationsReady || isLoadingStations ? <p>Loading stations...</p> : null}
+            <ul className="station-list">
+              {filteredStations.map((station) => (
+                <li key={station.id}>
+                  <button type="button" className="station-item" onClick={() => void selectStation(station)}>
+                    <span>{station.name}</span>
+                    <small>{Math.round(station.distanceMeters)} m</small>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : (
+          <section>
+            <div className="station-title-row">
+              <h2>{selectedStation.name}</h2>
+              <button type="button" className="ghost" onClick={() => setSelectedStation(null)}>
+                Back
+              </button>
+            </div>
+
+            {isLoadingArrivals ? <p>Loading arrivals...</p> : null}
+
+            <ul className="arrival-list">
+              {stationArrivals?.arrivals.map((arrival) => (
+                <li key={`${arrival.vehicleId}-${arrival.lineId}`}>
+                  <div className="arrival-row">
+                    <span className="line-chip">Line {arrival.lineId}</span>
+                    <span>Vehicle {arrival.vehicleId}</span>
+                    <strong>{Math.max(0, Math.round(arrival.estimatedSeconds / 60))} min</strong>
+                  </div>
+                </li>
+              ))}
+            </ul>
+
+            {!isLoadingArrivals && (!stationArrivals || stationArrivals.arrivals.length === 0) ? (
+              <p>No live arrivals yet for this station.</p>
+            ) : null}
+          </section>
+        )}
+      </aside>
+    </div>
+  )
+}
+
+export default App
+
+
+
+
+
+

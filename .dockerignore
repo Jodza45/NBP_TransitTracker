@@ -1,0 +1,10 @@
+﻿**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+**/node_modules/
+.git/
+.dotnet/
+.nuget/
+.npm-cache/
+TransitTracker.Web/
