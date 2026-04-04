@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using StackExchange.Redis;
 using TransitTracker.Application.Interfaces;
@@ -22,10 +22,12 @@ public static class DependencyInjection
         services.AddSingleton<IPubSubService, PubSubService>();
         services.AddSingleton<EtaCalculationService>();
         services.AddSingleton<IEtaService, EtaService>();
+        services.AddSingleton<IGtfsImportService, GtfsImportService>();
 
         var disableBackgroundWorkers = configuration.GetValue<bool>("Infrastructure:DisableBackgroundWorkers");
         if (!disableBackgroundWorkers)
         {
+            services.AddHostedService<StartupBootstrapWorker>();
             services.AddHostedService<LocationWorker>();
             services.AddHostedService<EtaWorker>();
             services.AddHostedService<NisSimulationWorker>();

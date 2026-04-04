@@ -1,4 +1,4 @@
-﻿services:
+services:
   redis:
     image: redis/redis-stack:latest
     container_name: transittracker-redis
@@ -19,6 +19,11 @@
       Redis__ConnectionString: ${REDIS_CONNECTION:-redis:6379}
       ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
       ASPNETCORE_URLS: ${ASPNETCORE_URLS:-http://+:8080}
+      Bootstrap__Enabled: ${BOOTSTRAP_ENABLED:-true}
+      Bootstrap__ForceGtfsImport: ${BOOTSTRAP_FORCE_GTFS_IMPORT:-false}
+      Simulation__Enabled: ${SIMULATION_ENABLED:-true}
+      Simulation__TickMs: ${SIMULATION_TICK_MS:-1000}
+      Simulation__DwellMs: ${SIMULATION_DWELL_MS:-3000}
     ports:
       - "${API_PORT:-5000}:8080"
 

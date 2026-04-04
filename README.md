@@ -83,3 +83,17 @@ Root `.gitignore` already excludes:
 - logs and binlogs
 
 Commit only source code, templates (like `.env.example`), and docs.
+
+## GTFS route import (Nis)
+
+To map each line to exact station sequence (and avoid showing unrelated buses at a station), import official Nis GTFS:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:5000/api/v1/gtfs/import-nis"
+```
+
+If you also want demo vehicles auto-bound to imported lines for testing arrivals:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:5000/api/v1/gtfs/import-nis?force=true"
+```

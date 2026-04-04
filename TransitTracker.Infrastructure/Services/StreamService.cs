@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
 using TransitTracker.Application.DTOs;
 using TransitTracker.Application.Interfaces;
@@ -26,8 +26,14 @@ public sealed class StreamService : IStreamService
         }
         catch (RedisServerException ex) when (ex.Message.Contains("BUSYGROUP", StringComparison.OrdinalIgnoreCase))
         {
-            // group already exists
         }
+    }
+
+    public async Task SetGroupToLatestAsync(string stream, string group, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var db = _connectionMultiplexer.GetDatabase();
+        await db.ExecuteAsync("XGROUP", "SETID", stream, group, "$", "ENTRIESREAD", 0);
     }
 
     public async Task<string> PublishAsync(string stream, IReadOnlyDictionary<string, string> values, CancellationToken cancellationToken)

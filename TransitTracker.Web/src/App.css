@@ -1,4 +1,4 @@
-﻿@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
 
 .layout {
   height: 100dvh;
@@ -211,3 +211,35 @@
     width: 100%;
   }
 }
+
+.arrival-track-btn {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  color: #e5e7eb;
+  font: inherit;
+}
+
+.arrival-track-btn .arrival-row {
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+}
+
+.arrival-track-btn:hover .arrival-row {
+  border-left-color: #67e8f9;
+  box-shadow: inset 0 0 0 1px rgba(103, 232, 249, 0.25);
+}
+
+.arrival-track-btn.is-tracked .arrival-row {
+  border-left-color: #f59e0b;
+  background: #17213b;
+  box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.45);
+}
+
+.arrival-track-btn:focus-visible .arrival-row {
+  outline: 2px solid #67e8f9;
+  outline-offset: 2px;
+}
+

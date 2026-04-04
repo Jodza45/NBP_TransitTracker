@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from 'react-leaflet'
 import { Icon, Marker as LeafletMarker } from 'leaflet'
 import type { LeafletEvent, LeafletMouseEvent } from 'leaflet'
@@ -32,6 +32,19 @@ type StationArrivalsResponse = {
   arrivals: StationArrival[]
 }
 
+type LineDetails = {
+  id: string
+  name: string
+  stationIds: string[]
+}
+
+type VehicleLocation = {
+  vehicleId: string
+  latitude: number
+  longitude: number
+  timestamp: string
+}
+
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:5000'
 const nisCenter: LatLng = { lat: 43.3209, lng: 21.8958 }
 const nisBounds: [[number, number], [number, number]] = [
@@ -41,12 +54,12 @@ const nisBounds: [[number, number], [number, number]] = [
 const minStationsRadiusMeters = 500
 const maxStationsRadiusMeters = 5000
 const cyrToLatMap: Record<string, string> = {
-  А: 'A', а: 'a', Б: 'B', б: 'b', В: 'V', в: 'v', Г: 'G', г: 'g', Д: 'D', д: 'd',
-  Ђ: 'Dj', ђ: 'dj', Е: 'E', е: 'e', Ж: 'Z', ж: 'z', З: 'Z', з: 'z', И: 'I', и: 'i',
-  Ј: 'J', ј: 'j', К: 'K', к: 'k', Л: 'L', л: 'l', Љ: 'Lj', љ: 'lj', М: 'M', м: 'm',
-  Н: 'N', н: 'n', Њ: 'Nj', њ: 'nj', О: 'O', о: 'o', П: 'P', п: 'p', Р: 'R', р: 'r',
-  С: 'S', с: 's', Т: 'T', т: 't', Ћ: 'C', ћ: 'c', У: 'U', у: 'u', Ф: 'F', ф: 'f',
-  Х: 'H', х: 'h', Ц: 'C', ц: 'c', Ч: 'C', ч: 'c', Џ: 'Dz', џ: 'dz', Ш: 'S', ш: 's',
+  '\u0410': 'A', '\u0430': 'a', '\u0411': 'B', '\u0431': 'b', '\u0412': 'V', '\u0432': 'v', '\u0413': 'G', '\u0433': 'g', '\u0414': 'D', '\u0434': 'd',
+  '\u0402': 'Dj', '\u0452': 'dj', '\u0415': 'E', '\u0435': 'e', '\u0416': 'Z', '\u0436': 'z', '\u0417': 'Z', '\u0437': 'z', '\u0418': 'I', '\u0438': 'i',
+  '\u0408': 'J', '\u0458': 'j', '\u041A': 'K', '\u043A': 'k', '\u041B': 'L', '\u043B': 'l', '\u0409': 'Lj', '\u0459': 'lj', '\u041C': 'M', '\u043C': 'm',
+  '\u041D': 'N', '\u043D': 'n', '\u040A': 'Nj', '\u045A': 'nj', '\u041E': 'O', '\u043E': 'o', '\u041F': 'P', '\u043F': 'p', '\u0420': 'R', '\u0440': 'r',
+  '\u0421': 'S', '\u0441': 's', '\u0422': 'T', '\u0442': 't', '\u040B': 'C', '\u045B': 'c', '\u0423': 'U', '\u0443': 'u', '\u0424': 'F', '\u0444': 'f',
+  '\u0425': 'H', '\u0445': 'h', '\u0426': 'C', '\u0446': 'c', '\u0427': 'C', '\u0447': 'c', '\u040F': 'Dz', '\u045F': 'dz', '\u0428': 'S', '\u0448': 's',
 }
 
 function toLatin(text: string): string {
@@ -75,6 +88,18 @@ const selectedIcon = new Icon({
   shadowUrl: 'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/images/marker-shadow.png',
   iconSize: [25, 41],
   iconAnchor: [12, 41],
+})
+
+const trackedVehicleIcon = new Icon({
+  iconUrl: svgDataUri(`<svg xmlns='http://www.w3.org/2000/svg' width='30' height='30' viewBox='0 0 30 30'>
+  <circle cx='15' cy='15' r='13' fill='#f59e0b' stroke='#7c2d12' stroke-width='2'/>
+  <rect x='8' y='9' width='14' height='9' rx='2' fill='white'/>
+  <circle cx='11' cy='20' r='1.8' fill='#111827'/>
+  <circle cx='19' cy='20' r='1.8' fill='#111827'/>
+  </svg>`),
+  iconSize: [30, 30],
+  iconAnchor: [15, 15],
+  popupAnchor: [0, -14],
 })
 
 function clampToNis(position: LatLng): LatLng {
@@ -125,6 +150,9 @@ function App() {
   const [allStations, setAllStations] = useState<Station[]>([])
   const [selectedStation, setSelectedStation] = useState<NearbyStation | null>(null)
   const [stationArrivals, setStationArrivals] = useState<StationArrivalsResponse | null>(null)
+  const [lineDetailsById, setLineDetailsById] = useState<Record<string, LineDetails>>({})
+  const [trackedVehicleId, setTrackedVehicleId] = useState<string | null>(null)
+  const [trackedVehiclePosition, setTrackedVehiclePosition] = useState<LatLng | null>(null)
   const [isLoadingStations, setIsLoadingStations] = useState(false)
   const [isLoadingArrivals, setIsLoadingArrivals] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -153,6 +181,13 @@ function App() {
     return nearbyStations.filter((station) => toLatin(station.name).toLowerCase().includes(normalizedSearch))
   }, [nearbyStations, searchTerm])
 
+  const stationNameById = useMemo(() => {
+    return allStations.reduce<Record<string, string>>((acc, station) => {
+      acc[station.id] = station.name
+      return acc
+    }, {})
+  }, [allStations])
+
   useEffect(() => {
     if (hasInitialized.current) {
       return
@@ -167,11 +202,7 @@ function App() {
       try {
         await fetch(`${apiBaseUrl}/api/v1/stations/import-osm-nis`, { method: 'POST' }).catch(() => undefined)
 
-        const allEndpoints = [
-          `${apiBaseUrl}/api/v1/stations/all`,
-          `${apiBaseUrl}/api/stations/all`,
-        ]
-
+        const allEndpoints = [`${apiBaseUrl}/api/v1/stations/all`, `${apiBaseUrl}/api/stations/all`]
         let stations: Station[] = []
 
         for (const endpoint of allEndpoints) {
@@ -249,6 +280,134 @@ function App() {
     hasAutoLocated.current = true
     locateMe()
   }, [])
+
+  useEffect(() => {
+    const loadLineDetails = async () => {
+      if (!stationArrivals || stationArrivals.arrivals.length === 0) {
+        return
+      }
+
+      const lineIds = Array.from(new Set(stationArrivals.arrivals.map((x) => x.lineId)))
+      const missing = lineIds.filter((lineId) => !lineDetailsById[lineId])
+      if (missing.length === 0) {
+        return
+      }
+
+      const loaded = await Promise.all(
+        missing.map(async (lineId) => {
+          const urls = [`${apiBaseUrl}/api/v1/lines/${lineId}`, `${apiBaseUrl}/api/lines/${lineId}`]
+
+          for (const url of urls) {
+            const response = await fetch(url)
+            if (!response.ok) {
+              continue
+            }
+
+            return (await response.json()) as LineDetails
+          }
+
+          return null
+        }),
+      )
+
+      const next: Record<string, LineDetails> = {}
+      for (const line of loaded) {
+        if (line) {
+          next[line.id] = line
+        }
+      }
+
+      if (Object.keys(next).length > 0) {
+        setLineDetailsById((prev) => ({ ...prev, ...next }))
+      }
+    }
+
+    void loadLineDetails()
+  }, [lineDetailsById, stationArrivals])
+
+  function getLineBadge(lineId: string): string {
+    const line = lineDetailsById[lineId]
+    if (!line) {
+      return lineId.replace(/^gtfs:/i, '').split(':')[0] || lineId
+    }
+
+    const normalized = toLatin(line.name)
+    const first = normalized.split('-')[0]?.trim()
+    return first || lineId
+  }
+
+  function getLineDirection(lineId: string): string {
+    const line = lineDetailsById[lineId]
+    if (!line || line.stationIds.length === 0) {
+      return 'Direction unavailable'
+    }
+
+    const firstName = stationNameById[line.stationIds[0]] ?? line.stationIds[0]
+    const lastName = stationNameById[line.stationIds[line.stationIds.length - 1]] ?? line.stationIds[line.stationIds.length - 1]
+    return `${firstName} - ${lastName}`
+  }
+
+  async function getVehicleLocation(vehicleId: string): Promise<VehicleLocation | null> {
+    const urls = [`${apiBaseUrl}/api/v1/vehicles/${vehicleId}/location`, `${apiBaseUrl}/api/vehicles/${vehicleId}/location`]
+
+    for (const url of urls) {
+      const response = await fetch(url)
+      if (!response.ok) {
+        continue
+      }
+
+      return (await response.json()) as VehicleLocation
+    }
+
+    return null
+  }
+
+  const trackVehicle = async (arrival: StationArrival) => {
+    if (trackedVehicleId === arrival.vehicleId) {
+      setTrackedVehicleId(null)
+      setTrackedVehiclePosition(null)
+      setError(null)
+      return
+    }
+
+    setTrackedVehicleId(arrival.vehicleId)
+
+    const location = await getVehicleLocation(arrival.vehicleId)
+    if (!location) {
+      setError('Vehicle location is not available yet.')
+      return
+    }
+
+    const next = clampToNis({ lat: location.latitude, lng: location.longitude })
+    setTrackedVehiclePosition(next)
+    setSelectedPosition(next)
+    setError(null)
+  }
+
+  useEffect(() => {
+    if (!trackedVehicleId) {
+      return
+    }
+
+    const refresh = async () => {
+      const location = await getVehicleLocation(trackedVehicleId)
+      if (!location) {
+        return
+      }
+
+      const next = clampToNis({ lat: location.latitude, lng: location.longitude })
+      setTrackedVehiclePosition(next)
+    }
+
+    void refresh()
+    const timer = window.setInterval(() => {
+      void refresh()
+    }, 2500)
+
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [trackedVehicleId])
 
   const selectStation = async (station: NearbyStation) => {
     setSelectedStation(station)
@@ -331,6 +490,12 @@ function App() {
               </Popup>
             </Marker>
           ))}
+
+          {trackedVehicleId && trackedVehiclePosition ? (
+            <Marker position={[trackedVehiclePosition.lat, trackedVehiclePosition.lng]} icon={trackedVehicleIcon}>
+              <Popup>Tracking vehicle {trackedVehicleId}</Popup>
+            </Marker>
+          ) : null}
         </MapContainer>
 
         <button className="locate-fab" onClick={locateMe} aria-label="Use my location" title="Use my location">
@@ -348,7 +513,9 @@ function App() {
             <div className="range-row">
               <h2>Nearby Stations ({filteredStations.length})</h2>
               <div className="range-control">
-                <label htmlFor="rangeMeters">Range: {stationsRadiusMeters >= 1000 ? `${(stationsRadiusMeters / 1000).toFixed(1)} km` : `${stationsRadiusMeters} m`}</label>
+                <label htmlFor="rangeMeters">
+                  Range: {stationsRadiusMeters >= 1000 ? `${(stationsRadiusMeters / 1000).toFixed(1)} km` : `${stationsRadiusMeters} m`}
+                </label>
                 <input
                   id="rangeMeters"
                   type="range"
@@ -360,6 +527,7 @@ function App() {
                 />
               </div>
             </div>
+
             {!isStationsReady || isLoadingStations ? <p>Loading stations...</p> : null}
             <ul className="station-list">
               {filteredStations.map((station) => (
@@ -386,11 +554,18 @@ function App() {
             <ul className="arrival-list">
               {stationArrivals?.arrivals.map((arrival) => (
                 <li key={`${arrival.vehicleId}-${arrival.lineId}`}>
-                  <div className="arrival-row">
-                    <span className="line-chip">Line {arrival.lineId}</span>
-                    <span>Vehicle {arrival.vehicleId}</span>
-                    <strong>{Math.max(0, Math.round(arrival.estimatedSeconds / 60))} min</strong>
-                  </div>
+                  <button
+                    type="button"
+                    className={`arrival-track-btn ${trackedVehicleId === arrival.vehicleId ? 'is-tracked' : ''}`}
+                    onClick={() => void trackVehicle(arrival)}
+                    title="Show and track this bus on map"
+                  >
+                    <div className="arrival-row">
+                      <span className="line-chip">{getLineBadge(arrival.lineId)}</span>
+                      <span>{getLineDirection(arrival.lineId)}</span>
+                      <strong>{Math.max(0, Math.round(arrival.estimatedSeconds / 60))} min</strong>
+                    </div>
+                  </button>
                 </li>
               ))}
             </ul>
@@ -406,7 +581,6 @@ function App() {
 }
 
 export default App
-
 
 
 

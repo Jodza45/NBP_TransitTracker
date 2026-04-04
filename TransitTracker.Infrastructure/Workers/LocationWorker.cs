@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Hosting;
@@ -41,6 +41,7 @@ public sealed class LocationWorker : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await _streamService.EnsureConsumerGroupAsync("gps-updates", "transit-workers", stoppingToken);
+        await _streamService.SetGroupToLatestAsync("gps-updates", "transit-workers", stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -88,3 +89,5 @@ public sealed class LocationWorker : BackgroundService
         }
     }
 }
+
+

@@ -170,14 +170,13 @@ public sealed class StationController : ControllerBase
             }
         }
 
-        var enforceLineFilter = linesWithStation.Count > 0;
         var activeVehicles = await _redisService.SetMembersAsync("active-vehicles", cancellationToken);
         var arrivals = new List<StationArrivalDto>();
 
         foreach (var vehicleId in activeVehicles)
         {
             var vehicleResult = await _redisService.GetAsync<Vehicle>(RedisKeys.Vehicle(vehicleId), cancellationToken);
-            if (!vehicleResult.IsSuccess || !vehicleResult.Value.IsActive || (enforceLineFilter && !linesWithStation.Contains(vehicleResult.Value.LineId)))
+            if (!vehicleResult.IsSuccess || !vehicleResult.Value.IsActive || !linesWithStation.Contains(vehicleResult.Value.LineId))
             {
                 continue;
             }
@@ -391,6 +390,8 @@ public sealed class StationController : ControllerBase
         public Dictionary<string, string>? Tags { get; set; }
     }
 }
+
+
 
 
 

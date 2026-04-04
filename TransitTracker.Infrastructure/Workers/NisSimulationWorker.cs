@@ -1,4 +1,5 @@
-﻿using System.Globalization;
+using System.Globalization;
+using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -10,6 +11,8 @@ namespace TransitTracker.Infrastructure.Workers;
 
 public sealed class NisSimulationWorker : BackgroundService
 {
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
     private readonly IRedisService _redisService;
     private readonly IStreamService _streamService;
     private readonly IConfiguration _configuration;
@@ -36,26 +39,44 @@ public sealed class NisSimulationWorker : BackgroundService
             return;
         }
 
-        var vehiclesPerLine = Math.Max(1, _configuration.GetValue<int?>("Simulation:VehiclesPerLine") ?? 6);
-        var tickMs = Math.Max(300, _configuration.GetValue<int?>("Simulation:TickMs") ?? 1000);
-
-        var fleet = await SeedFleetAsync(vehiclesPerLine, stoppingToken);
-        if (fleet.Count == 0)
-        {
-            _logger.LogWarning("Nis simulation has no active routes (expected line ids like nis-1, nis-2, nis-6, nis-13)." );
-            return;
-        }
-
-        _logger.LogInformation("Nis simulation started with {Count} vehicles.", fleet.Count);
+        var tickMs = Math.Max(250, _configuration.GetValue<int?>("Simulation:TickMs") ?? 1000);
+        var dwellMs = Math.Max(0, _configuration.GetValue<int?>("Simulation:DwellMs") ?? 3000);
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            try
+            {
+                var fleet = await LoadFleetAsync(stoppingToken);
+                if (fleet.Count == 0)
+                {
+                    _logger.LogWarning("Nis simulation found no active vehicles with valid line station paths.");
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                    continue;
+                }
+
+                _logger.LogInformation("Nis simulation tick loop started for {Count} vehicles.", fleet.Count);
+                await RunTickLoopAsync(fleet, tickMs, dwellMs, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Nis simulation failed. Retrying in 5 seconds.");
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            }
+        }
+    }
+
+    private async Task RunTickLoopAsync(List<VehicleState> fleet, int tickMs, int dwellMs, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
             foreach (var state in fleet)
             {
-                var points = state.Points;
-                var start = points[state.SegmentIndex];
-                var next = points[(state.SegmentIndex + 1) % points.Count];
-                var current = Interpolate(start, next, state.Progress);
+                AdvanceState(state, tickMs, dwellMs);
+                var current = InterpolateCurrent(state);
 
                 var values = new Dictionary<string, string>
                 {
@@ -65,132 +86,243 @@ public sealed class NisSimulationWorker : BackgroundService
                     ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture)
                 };
 
-                await _streamService.PublishAsync("gps-updates", values, stoppingToken);
-
-                state.Progress += state.Speed;
-                if (state.Progress >= 1d)
-                {
-                    state.Progress = 0d;
-                    state.SegmentIndex = (state.SegmentIndex + 1) % points.Count;
-                }
+                await _streamService.PublishAsync("gps-updates", values, cancellationToken);
             }
 
-            await Task.Delay(tickMs, stoppingToken);
+            await Task.Delay(tickMs, cancellationToken);
         }
     }
 
-    private async Task<List<VehicleState>> SeedFleetAsync(int vehiclesPerLine, CancellationToken cancellationToken)
+    private async Task<List<VehicleState>> LoadFleetAsync(CancellationToken cancellationToken)
     {
-        var routeCatalog = BuildRouteCatalog();
-        var fleet = new List<VehicleState>();
-        var random = new Random(20260404);
+        var activeVehicleIds = await _redisService.SetMembersAsync("active-vehicles", cancellationToken);
+        var states = new List<VehicleState>(activeVehicleIds.Count);
+        var random = new Random();
 
-        foreach (var (lineId, shape) in routeCatalog)
+        foreach (var vehicleId in activeVehicleIds)
         {
-            for (var i = 1; i <= vehiclesPerLine; i++)
+            var vehicleResult = await _redisService.GetAsync<Vehicle>(RedisKeys.Vehicle(vehicleId), cancellationToken);
+            if (!vehicleResult.IsSuccess || !vehicleResult.Value.IsActive)
             {
-                var vehicleId = $"sim-{lineId}-{i:D2}";
-
-                var vehicleResult = await _redisService.GetAsync<Vehicle>(RedisKeys.Vehicle(vehicleId), cancellationToken);
-                if (!vehicleResult.IsSuccess)
-                {
-                    var vehicle = new Vehicle
-                    {
-                        Id = vehicleId,
-                        LineId = lineId,
-                        Type = VehicleType.Bus,
-                        IsActive = true
-                    };
-
-                    await _redisService.SetAsync(RedisKeys.Vehicle(vehicleId), vehicle, null, cancellationToken);
-                }
-
-                await _redisService.SetAddAsync("active-vehicles", vehicleId, cancellationToken);
-
-                var segment = random.Next(0, shape.Count - 1);
-                var progress = random.NextDouble();
-                var speed = 0.03 + (random.NextDouble() * 0.05);
-
-                fleet.Add(new VehicleState(vehicleId, shape)
-                {
-                    SegmentIndex = segment,
-                    Progress = progress,
-                    Speed = speed
-                });
+                continue;
             }
+
+            var lineResult = await _redisService.HashGetAsync(RedisKeys.Line(vehicleResult.Value.LineId), "data", cancellationToken);
+            if (!lineResult.IsSuccess)
+            {
+                continue;
+            }
+
+            var line = JsonSerializer.Deserialize<Line>(lineResult.Value, JsonOptions);
+            if (line is null || line.StationIds.Count < 2)
+            {
+                continue;
+            }
+
+            var points = await LoadRoutePointsAsync(line.StationIds, cancellationToken);
+            if (points.Count < 2)
+            {
+                continue;
+            }
+
+            var startIndex = random.Next(0, points.Count - 1);
+            var direction = random.Next(0, 2) == 0 ? 1 : -1;
+            if (direction < 0 && startIndex == 0)
+            {
+                startIndex = points.Count - 1;
+            }
+
+            var fromIndex = direction > 0 ? startIndex : startIndex - 1;
+            if (fromIndex < 0)
+            {
+                fromIndex = 0;
+            }
+
+            if (fromIndex >= points.Count - 1)
+            {
+                fromIndex = points.Count - 2;
+            }
+
+            var speedMetersPerSecond = vehicleResult.Value.Type == VehicleType.Tram ? 11.11 : 8.33;
+
+            states.Add(new VehicleState(vehicleId, points)
+            {
+                FromIndex = fromIndex,
+                Direction = direction,
+                Progress = random.NextDouble(),
+                DwellMsRemaining = 0,
+                SpeedMetersPerSecond = speedMetersPerSecond
+            });
         }
 
-        return fleet;
+        return states;
     }
 
-    private static Dictionary<string, List<RoutePoint>> BuildRouteCatalog()
+    private async Task<List<RoutePoint>> LoadRoutePointsAsync(IReadOnlyCollection<string> stationIds, CancellationToken cancellationToken)
     {
-        return new Dictionary<string, List<RoutePoint>>(StringComparer.OrdinalIgnoreCase)
+        var points = new List<RoutePoint>(stationIds.Count);
+
+        foreach (var stationId in stationIds)
         {
-            ["nis-1"] =
-            [
-                new(43.2927, 21.9163),
-                new(43.3015, 21.9195),
-                new(43.3115, 21.9185),
-                new(43.3175, 21.9145),
-                new(43.3208, 21.9060),
-                new(43.3209, 21.8958),
-                new(43.3200, 21.9050),
-                new(43.3190, 21.9243),
-                new(43.3275, 21.9280),
-                new(43.3367, 21.9301)
-            ],
-            ["nis-2"] =
-            [
-                new(43.3139, 21.8689),
-                new(43.3145, 21.8790),
-                new(43.3165, 21.8870),
-                new(43.3209, 21.8958),
-                new(43.3201, 21.9009),
-                new(43.3186, 21.9127)
-            ],
-            ["nis-6"] =
-            [
-                new(43.3070, 21.9087),
-                new(43.3040, 21.9160),
-                new(43.3036, 21.9230),
-                new(43.3110, 21.9215),
-                new(43.3165, 21.9164),
-                new(43.3190, 21.9090),
-                new(43.3201, 21.9009),
-                new(43.3209, 21.8958)
-            ],
-            ["nis-13"] =
-            [
-                new(43.3224, 21.8875),
-                new(43.3240, 21.9003),
-                new(43.3209, 21.8958),
-                new(43.3233, 21.9038),
-                new(43.3190, 21.9243)
-            ]
-        };
+            var stationResult = await _redisService.HashGetAsync(RedisKeys.Station(stationId), "data", cancellationToken);
+            if (!stationResult.IsSuccess)
+            {
+                continue;
+            }
+
+            var station = JsonSerializer.Deserialize<Station>(stationResult.Value, JsonOptions);
+            if (station is null)
+            {
+                continue;
+            }
+
+            if (points.Count > 0)
+            {
+                var last = points[^1];
+                if (Math.Abs(last.Latitude - station.Latitude) < 0.000001 && Math.Abs(last.Longitude - station.Longitude) < 0.000001)
+                {
+                    continue;
+                }
+            }
+
+            points.Add(new RoutePoint(station.Latitude, station.Longitude));
+        }
+
+        return points;
     }
 
-    private static RoutePoint Interpolate(RoutePoint a, RoutePoint b, double t)
+    private static void AdvanceState(VehicleState state, int tickMs, int dwellMs)
     {
+        if (state.DwellMsRemaining > 0)
+        {
+            state.DwellMsRemaining = Math.Max(0, state.DwellMsRemaining - tickMs);
+            return;
+        }
+
+        var remainingMeters = state.SpeedMetersPerSecond * (tickMs / 1000d);
+
+        while (remainingMeters > 0)
+        {
+            var from = state.Route[state.FromIndex];
+            var toIndex = GetToIndex(state);
+            var to = state.Route[toIndex];
+
+            var segmentLength = DistanceMeters(from, to);
+            if (segmentLength < 0.5)
+            {
+                state.Progress = 1;
+            }
+            else
+            {
+                var progressDelta = remainingMeters / segmentLength;
+                var capacity = 1d - state.Progress;
+
+                if (progressDelta < capacity)
+                {
+                    state.Progress += progressDelta;
+                    remainingMeters = 0;
+                    break;
+                }
+
+                remainingMeters -= capacity * segmentLength;
+                state.Progress = 1;
+            }
+
+            AdvanceToNextSegment(state);
+            state.DwellMsRemaining = dwellMs;
+            if (state.DwellMsRemaining > 0)
+            {
+                break;
+            }
+        }
+    }
+
+    private static RoutePoint InterpolateCurrent(VehicleState state)
+    {
+        var from = state.Route[state.FromIndex];
+        var to = state.Route[GetToIndex(state)];
+        var t = Math.Clamp(state.Progress, 0d, 1d);
+
         return new RoutePoint(
-            a.Latitude + ((b.Latitude - a.Latitude) * t),
-            a.Longitude + ((b.Longitude - a.Longitude) * t));
+            from.Latitude + ((to.Latitude - from.Latitude) * t),
+            from.Longitude + ((to.Longitude - from.Longitude) * t));
+    }
+
+    private static void AdvanceToNextSegment(VehicleState state)
+    {
+        var arrivedIndex = GetToIndex(state);
+
+        if (arrivedIndex == state.Route.Count - 1)
+        {
+            state.Direction = -1;
+            state.FromIndex = state.Route.Count - 1;
+            state.Progress = 0;
+            return;
+        }
+
+        if (arrivedIndex == 0)
+        {
+            state.Direction = 1;
+            state.FromIndex = 0;
+            state.Progress = 0;
+            return;
+        }
+
+        state.FromIndex = arrivedIndex;
+        state.Progress = 0;
+    }
+
+    private static int GetToIndex(VehicleState state)
+    {
+        var toIndex = state.FromIndex + state.Direction;
+        if (toIndex < 0)
+        {
+            return 0;
+        }
+
+        if (toIndex >= state.Route.Count)
+        {
+            return state.Route.Count - 1;
+        }
+
+        return toIndex;
+    }
+
+    private static double DistanceMeters(RoutePoint a, RoutePoint b)
+    {
+        const double earthRadius = 6371000d;
+        var dLat = ToRadians(b.Latitude - a.Latitude);
+        var dLon = ToRadians(b.Longitude - a.Longitude);
+        var lat1 = ToRadians(a.Latitude);
+        var lat2 = ToRadians(b.Latitude);
+
+        var haversine =
+            Math.Sin(dLat / 2) * Math.Sin(dLat / 2) +
+            Math.Cos(lat1) * Math.Cos(lat2) * Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
+
+        return 2d * earthRadius * Math.Atan2(Math.Sqrt(haversine), Math.Sqrt(1d - haversine));
+    }
+
+    private static double ToRadians(double value)
+    {
+        return value * Math.PI / 180d;
     }
 
     private sealed class VehicleState
     {
-        public VehicleState(string vehicleId, List<RoutePoint> points)
+        public VehicleState(string vehicleId, List<RoutePoint> route)
         {
             VehicleId = vehicleId;
-            Points = points;
+            Route = route;
         }
 
         public string VehicleId { get; }
-        public List<RoutePoint> Points { get; }
-        public int SegmentIndex { get; set; }
+        public List<RoutePoint> Route { get; }
+        public int FromIndex { get; set; }
+        public int Direction { get; set; }
         public double Progress { get; set; }
-        public double Speed { get; set; }
+        public int DwellMsRemaining { get; set; }
+        public double SpeedMetersPerSecond { get; set; }
     }
 
     private sealed record RoutePoint(double Latitude, double Longitude);
