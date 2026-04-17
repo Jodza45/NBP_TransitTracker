@@ -1,4 +1,6 @@
-﻿using System.Text.Json;
+using System.Globalization;
+using System.Text;
+using System.Text.Json;
 using Asp.Versioning;
 using Microsoft.AspNetCore.Mvc;
 using TransitTracker.API.Contracts;
@@ -81,6 +83,197 @@ public sealed class StationController : ControllerBase
         }
 
         return Ok(stations.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToArray());
+    }
+
+    [HttpPost("cleanup")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> CleanupStations([FromQuery] double dedupRadiusMeters = 65, [FromQuery] bool removeUnassigned = true, CancellationToken cancellationToken = default)
+    {
+        if (dedupRadiusMeters <= 0 || dedupRadiusMeters > 500)
+        {
+            return Problem(title: "Invalid radius", detail: "Dedup radius must be between 1 and 500 meters.", statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        var stationIds = await _redisService.SetMembersAsync("stations:all", cancellationToken);
+        var stations = new List<Station>(stationIds.Count);
+
+        foreach (var stationId in stationIds)
+        {
+            var stationResult = await _redisService.HashGetAsync(RedisKeys.Station(stationId), "data", cancellationToken);
+            if (!stationResult.IsSuccess)
+            {
+                continue;
+            }
+
+            var station = JsonSerializer.Deserialize<Station>(stationResult.Value, JsonOptions);
+            if (station is null || !NisGeoFence.Contains(station.Latitude, station.Longitude))
+            {
+                continue;
+            }
+
+            stations.Add(station);
+        }
+
+        var duplicateToCanonical = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        var groups = stations
+            .GroupBy(x => NormalizeName(x.Name), StringComparer.Ordinal)
+            .Where(g => !string.IsNullOrWhiteSpace(g.Key))
+            .ToList();
+
+        foreach (var group in groups)
+        {
+            var ordered = group.OrderByDescending(StationPriority).ToList();
+            var consumed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var baseStation in ordered)
+            {
+                if (!consumed.Add(baseStation.Id))
+                {
+                    continue;
+                }
+
+                var cluster = new List<Station> { baseStation };
+
+                foreach (var candidate in ordered)
+                {
+                    if (consumed.Contains(candidate.Id))
+                    {
+                        continue;
+                    }
+
+                    var distance = DistanceMeters(baseStation.Latitude, baseStation.Longitude, candidate.Latitude, candidate.Longitude);
+                    if (distance <= dedupRadiusMeters)
+                    {
+                        consumed.Add(candidate.Id);
+                        cluster.Add(candidate);
+                    }
+                }
+
+                if (cluster.Count <= 1)
+                {
+                    continue;
+                }
+
+                var canonical = cluster.OrderByDescending(StationPriority).First();
+                foreach (var duplicate in cluster.Where(x => !string.Equals(x.Id, canonical.Id, StringComparison.OrdinalIgnoreCase)))
+                {
+                    duplicateToCanonical[duplicate.Id] = canonical.Id;
+                }
+            }
+        }
+
+        var lineIds = await _redisService.SetMembersAsync("lines:all", cancellationToken);
+        var usedStationIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var updatedLines = 0;
+
+        foreach (var lineId in lineIds)
+        {
+            var lineResult = await _redisService.HashGetAsync(RedisKeys.Line(lineId), "data", cancellationToken);
+            if (!lineResult.IsSuccess)
+            {
+                continue;
+            }
+
+            var line = JsonSerializer.Deserialize<Line>(lineResult.Value, JsonOptions);
+            if (line is null || line.StationIds.Count == 0)
+            {
+                continue;
+            }
+
+            var rewritten = new List<string>(line.StationIds.Count);
+            string? previous = null;
+
+            foreach (var stationId in line.StationIds)
+            {
+                var mapped = duplicateToCanonical.TryGetValue(stationId, out var canonical) ? canonical : stationId;
+                if (string.Equals(previous, mapped, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                rewritten.Add(mapped);
+                usedStationIds.Add(mapped);
+                previous = mapped;
+            }
+
+            if (!line.StationIds.SequenceEqual(rewritten, StringComparer.OrdinalIgnoreCase))
+            {
+                line.StationIds = rewritten;
+                await _redisService.HashSetFieldAsync(RedisKeys.Line(line.Id), "data", JsonSerializer.Serialize(line, JsonOptions), cancellationToken);
+
+                await _redisService.DeleteAsync($"line:{line.Id}:stations", cancellationToken);
+                foreach (var stationId in rewritten)
+                {
+                    await _redisService.SetAddAsync($"line:{line.Id}:stations", stationId, cancellationToken);
+                }
+
+                updatedLines++;
+            }
+        }
+
+        var removedStations = 0;
+        foreach (var duplicateId in duplicateToCanonical.Keys)
+        {
+            await _redisService.DeleteAsync(RedisKeys.Station(duplicateId), cancellationToken);
+            removedStations++;
+        }
+
+        if (removeUnassigned)
+        {
+            var allAfterDedup = await _redisService.SetMembersAsync("stations:all", cancellationToken);
+            foreach (var stationId in allAfterDedup)
+            {
+                if (usedStationIds.Contains(stationId))
+                {
+                    continue;
+                }
+
+                await _redisService.DeleteAsync(RedisKeys.Station(stationId), cancellationToken);
+                removedStations++;
+            }
+        }
+
+        var allStationsAfterCleanup = await _redisService.SetMembersAsync("stations:all", cancellationToken);
+
+        await _redisService.DeleteAsync("stations:all", cancellationToken);
+        await _redisService.DeleteAsync("stations:geo", cancellationToken);
+
+        var reindexed = 0;
+        foreach (var stationId in allStationsAfterCleanup)
+        {
+            var stationResult = await _redisService.HashGetAsync(RedisKeys.Station(stationId), "data", cancellationToken);
+            if (!stationResult.IsSuccess)
+            {
+                continue;
+            }
+
+            var station = JsonSerializer.Deserialize<Station>(stationResult.Value, JsonOptions);
+            if (station is null || !NisGeoFence.Contains(station.Latitude, station.Longitude))
+            {
+                continue;
+            }
+
+            await _redisService.SetAddAsync("stations:all", station.Id, cancellationToken);
+            await _redisService.GeoAddAsync("stations:geo", station.Id, station.Latitude, station.Longitude, cancellationToken);
+            reindexed++;
+        }
+
+        _logger.LogInformation(
+            "Station cleanup completed. DuplicateMappings={Mappings}, RemovedStations={Removed}, UpdatedLines={UpdatedLines}, RemainingStations={Remaining}.",
+            duplicateToCanonical.Count,
+            removedStations,
+            updatedLines,
+            reindexed);
+
+        return Ok(new
+        {
+            duplicateMappings = duplicateToCanonical.Count,
+            removedStations,
+            updatedLines,
+            remainingStations = reindexed
+        });
     }
 
     [HttpGet("nearby")]
@@ -376,6 +569,75 @@ public sealed class StationController : ControllerBase
         return $"Nis stop {element.Id}";
     }
 
+    private static int StationPriority(Station station)
+    {
+        if (station.Id.StartsWith("gtfs:", StringComparison.OrdinalIgnoreCase))
+        {
+            return 4;
+        }
+
+        if (!station.Id.StartsWith("osm-", StringComparison.OrdinalIgnoreCase))
+        {
+            return 3;
+        }
+
+        if (!station.Name.StartsWith("Nis stop", StringComparison.OrdinalIgnoreCase))
+        {
+            return 2;
+        }
+
+        return 1;
+    }
+
+    private static string NormalizeName(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return string.Empty;
+        }
+
+        var normalized = raw.Normalize(NormalizationForm.FormD);
+        var sb = new StringBuilder(normalized.Length);
+
+        foreach (var ch in normalized)
+        {
+            var category = CharUnicodeInfo.GetUnicodeCategory(ch);
+            if (category == UnicodeCategory.NonSpacingMark)
+            {
+                continue;
+            }
+
+            if (char.IsLetterOrDigit(ch))
+            {
+                sb.Append(char.ToUpperInvariant(ch));
+            }
+            else
+            {
+                sb.Append(' ');
+            }
+        }
+
+        return string.Join(' ', sb.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static double DistanceMeters(double lat1, double lng1, double lat2, double lng2)
+    {
+        const double earthRadius = 6371000;
+        var dLat = DegreesToRadians(lat2 - lat1);
+        var dLng = DegreesToRadians(lng2 - lng1);
+        var a =
+            Math.Sin(dLat / 2) * Math.Sin(dLat / 2) +
+            Math.Cos(DegreesToRadians(lat1)) * Math.Cos(DegreesToRadians(lat2)) *
+            Math.Sin(dLng / 2) * Math.Sin(dLng / 2);
+
+        return 2 * earthRadius * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
+    }
+
+    private static double DegreesToRadians(double degrees)
+    {
+        return degrees * (Math.PI / 180);
+    }
+
     private sealed class OverpassResponse
     {
         public List<OverpassElement> Elements { get; set; } = new();
@@ -390,11 +652,3 @@ public sealed class StationController : ControllerBase
         public Dictionary<string, string>? Tags { get; set; }
     }
 }
-
-
-
-
-
-
-
-
