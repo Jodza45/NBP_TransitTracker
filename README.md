@@ -80,15 +80,4 @@ docker compose down
 
 Nemoj koristiti `docker compose down -v` ako zelis da sacuvas Redis podatke.
 
-## Git
-
-Ne commitovati lokalne podatke i tajne:
-
-- `.env`
-- `osrm-data/`
-- `bin/`
-- `obj/`
-- `node_modules/`
-- `dist/`
-
-Primer konfiguracije je u `.env.example`, a pravi `.env` ostaje samo lokalno.
+Primer konfiguracije je u `.env.example`.
