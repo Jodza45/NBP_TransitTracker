@@ -1,48 +1,38 @@
-﻿# TransitTracker
+# TransitTracker
 
-Real-time public transit tracking system for Nis, built with .NET 8 Clean Architecture, Redis-only backend, and React + Leaflet frontend.
+TransitTracker je demo aplikacija za pracenje gradskog prevoza u Nisu.
 
-## Stack
+Backend je u .NET 8, frontend je React, a Redis se koristi kao jedina baza. Aplikacija prikazuje stanice na mapi, simulirane autobuse, dolaske na stanicu i pracenje izabranog autobusa.
 
-- Backend: ASP.NET Core 8, MediatR, FluentValidation, SignalR, Serilog
-- Storage: Redis Stack (GEO, Streams, Pub/Sub, Hash/Set)
-- Frontend: React + TypeScript + Vite + Leaflet
-- Orchestration: Docker Compose
+## Sta je potrebno
 
-## Repository structure
+- Docker Desktop
+- .NET 8 SDK
+- Node.js
 
-- `TransitTracker.API`
-- `TransitTracker.Application`
-- `TransitTracker.Infrastructure`
-- `TransitTracker.Domain`
-- `TransitTracker.Web`
-- `docker-compose.yml`
+## Pokretanje backenda
 
-## Environment setup
-
-1. Copy environment template:
+Prvo pripremi OSRM podatke za rute:
 
 ```powershell
 cd D:\TransitTracker
-Copy-Item .env.example .env
+powershell -ExecutionPolicy Bypass -File .\scripts\prepare-osrm.ps1
 ```
 
-2. Optional: edit `.env` ports/values.
-
-Default values are safe for local development.
-
-## Run backend with Docker
+Zatim pokreni Redis, OSRM i API:
 
 ```powershell
 cd D:\TransitTracker
-docker compose up -d --build redis api
+docker compose up -d --build
 ```
 
-- Swagger: [http://localhost:5000/swagger](http://localhost:5000/swagger)
-- Health: [http://localhost:5000/health](http://localhost:5000/health)
-- RedisInsight: [http://localhost:8001](http://localhost:8001)
+Korisni linkovi:
 
-## Run frontend
+- API Swagger: http://localhost:5000/swagger
+- RedisInsight: http://localhost:8001
+- Health check: http://localhost:5000/health
+
+## Pokretanje frontenda
 
 ```powershell
 cd D:\TransitTracker\TransitTracker.Web
@@ -50,50 +40,55 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-Vite will print the frontend URL (usually `http://localhost:5173`).
+Frontend se najcesce otvara na:
 
-## Safe-to-commit checklist
-
-Before pushing to Git, run:
-
-```powershell
-cd D:\TransitTracker
-
-# 1) Verify ignored files (env/secrets/build outputs should not be tracked)
-git status --short
-
-# 2) Check for accidental secrets (simple pattern scan)
-git grep -n -I -E "(password|passwd|secret|token|apikey|api_key|connectionstring|private key)" -- . ":(exclude)package-lock.json"
-
-# 3) Build checks
-dotnet build .\TransitTracker.sln
-cd .\TransitTracker.Web
-npm.cmd run build
+```text
+http://localhost:5173
 ```
 
-If command #2 reports real secrets, remove or move them to `.env` (never commit real credentials).
+## Podaci
 
-## Git ignore policy
+Stanice i linije se ucitavaju iz javnog GTFS izvora za Nis.
 
-Root `.gitignore` already excludes:
+Demo vozila se automatski prave pri pokretanju aplikacije. Broj vozila je podesen po liniji i smeru, tako da prometnije linije imaju vise simuliranih autobusa. Vozila se ne pojavljuju sva na istom mestu, vec imaju razmak u polascima.
 
-- `.env` and local env files
-- `bin/`, `obj/`, `dist/`, `node_modules/`
-- local caches (`.dotnet`, `.nuget`, `.npm-cache`)
-- logs and binlogs
+## Korisne komande
 
-Commit only source code, templates (like `.env.example`), and docs.
-
-## GTFS route import (Nis)
-
-To map each line to exact station sequence (and avoid showing unrelated buses at a station), import official Nis GTFS:
+Provera broja aktivnih vozila:
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:5000/api/v1/gtfs/import-nis"
+docker exec transittracker-redis redis-cli SCARD active-vehicles
 ```
 
-If you also want demo vehicles auto-bound to imported lines for testing arrivals:
+Provera jedne lokacije vozila:
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:5000/api/v1/gtfs/import-nis?force=true"
+Invoke-RestMethod -Method Get -Uri "http://localhost:5000/api/v1/vehicles/demo-gtfs-1-0-1/location"
 ```
+
+Rebuild samo API containera:
+
+```powershell
+docker compose up -d --build api
+```
+
+Zaustavljanje aplikacije bez brisanja podataka:
+
+```powershell
+docker compose down
+```
+
+Nemoj koristiti `docker compose down -v` ako zelis da sacuvas Redis podatke.
+
+## Git
+
+Ne commitovati lokalne podatke i tajne:
+
+- `.env`
+- `osrm-data/`
+- `bin/`
+- `obj/`
+- `node_modules/`
+- `dist/`
+
+Primer konfiguracije je u `.env.example`, a pravi `.env` ostaje samo lokalno.

@@ -15,7 +15,7 @@ Thumbs.db
 !.env.example
 **/.env
 **/.env.*
-**/.env.example
+!**/.env.example
 
 # =========================
 # Build outputs
@@ -51,3 +51,4 @@ pnpm-debug.log*
 # Local runtime data
 # =========================
 redis-data/
+osrm-data/

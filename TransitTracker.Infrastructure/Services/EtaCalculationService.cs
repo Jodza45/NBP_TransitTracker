@@ -8,14 +8,17 @@ public sealed class EtaCalculationService
 
     public int CalculateSeconds(VehicleLocation location, Station station, VehicleType type)
     {
-        var distanceKm = Haversine(location.Latitude, location.Longitude, station.Latitude, station.Longitude);
-        var speedKmh = type == VehicleType.Bus ? 30d : 40d;
-        var hours = distanceKm / speedKmh;
-        var seconds = (int)Math.Max(0, Math.Round(hours * 3600, MidpointRounding.AwayFromZero));
-        return seconds;
+        var distanceMeters = CalculateDistanceMeters(location.Latitude, location.Longitude, station.Latitude, station.Longitude);
+        return CalculateSecondsFromMeters(distanceMeters, type);
     }
 
-    private static double Haversine(double lat1, double lon1, double lat2, double lon2)
+    public int CalculateSecondsFromMeters(double distanceMeters, VehicleType type)
+    {
+        var speedMetersPerSecond = type == VehicleType.Bus ? 8.33d : 11.11d;
+        return (int)Math.Max(0, Math.Round(distanceMeters / speedMetersPerSecond, MidpointRounding.AwayFromZero));
+    }
+
+    public double CalculateDistanceMeters(double lat1, double lon1, double lat2, double lon2)
     {
         var dLat = DegreesToRadians(lat2 - lat1);
         var dLon = DegreesToRadians(lon2 - lon1);
@@ -26,7 +29,7 @@ public sealed class EtaCalculationService
                 * Math.Pow(Math.Sin(dLon / 2), 2);
 
         var c = 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
-        return EarthRadiusKm * c;
+        return EarthRadiusKm * c * 1000d;
     }
 
     private static double DegreesToRadians(double degrees) => degrees * Math.PI / 180d;

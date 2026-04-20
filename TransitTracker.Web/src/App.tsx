@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from 'react-leaflet'
 import { Icon, Marker as LeafletMarker } from 'leaflet'
 import type { LeafletEvent, LeafletMouseEvent } from 'leaflet'
@@ -53,6 +53,8 @@ const nisBounds: [[number, number], [number, number]] = [
 ]
 const minStationsRadiusMeters = 500
 const maxStationsRadiusMeters = 5000
+const trackedVehicleAnimationMs = 900
+const maxSearchSuggestions = 8
 const cyrToLatMap: Record<string, string> = {
   '\u0410': 'A', '\u0430': 'a', '\u0411': 'B', '\u0431': 'b', '\u0412': 'V', '\u0432': 'v', '\u0413': 'G', '\u0433': 'g', '\u0414': 'D', '\u0434': 'd',
   '\u0402': 'Dj', '\u0452': 'dj', '\u0415': 'E', '\u0435': 'e', '\u0416': 'Z', '\u0436': 'z', '\u0417': 'Z', '\u0437': 'z', '\u0418': 'I', '\u0438': 'i',
@@ -125,6 +127,13 @@ function distanceMeters(from: LatLng, to: LatLng): number {
   return earthRadius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 }
 
+function interpolateLatLng(from: LatLng, to: LatLng, progress: number): LatLng {
+  return {
+    lat: from.lat + (to.lat - from.lat) * progress,
+    lng: from.lng + (to.lng - from.lng) * progress,
+  }
+}
+
 function RecenterOnSelection({ position }: { position: LatLng }) {
   const map = useMap()
 
@@ -145,6 +154,82 @@ function ClickToPlaceMarker({ onPick }: { onPick: (position: LatLng) => void }) 
   return null
 }
 
+function SlidingVehicleMarker({ vehicleId, targetPosition }: { vehicleId: string; targetPosition: LatLng }) {
+  const map = useMap()
+  const markerRef = useRef<LeafletMarker | null>(null)
+  const currentPositionRef = useRef<LatLng | null>(null)
+  const animationFrameRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    const popup = document.createElement('span')
+    popup.textContent = `Tracking vehicle ${vehicleId}`
+
+    const marker = new LeafletMarker([targetPosition.lat, targetPosition.lng], { icon: trackedVehicleIcon })
+    marker.bindPopup(popup)
+    marker.addTo(map)
+
+    markerRef.current = marker
+    currentPositionRef.current = targetPosition
+
+    return () => {
+      if (animationFrameRef.current !== null) {
+        window.cancelAnimationFrame(animationFrameRef.current)
+        animationFrameRef.current = null
+      }
+
+      marker.removeFrom(map)
+      markerRef.current = null
+      currentPositionRef.current = null
+    }
+  }, [map, vehicleId])
+
+  useEffect(() => {
+    const marker = markerRef.current
+    if (!marker) {
+      return
+    }
+
+    if (animationFrameRef.current !== null) {
+      window.cancelAnimationFrame(animationFrameRef.current)
+      animationFrameRef.current = null
+    }
+
+    const start = currentPositionRef.current
+    if (!start || distanceMeters(start, targetPosition) > 1200) {
+      marker.setLatLng([targetPosition.lat, targetPosition.lng])
+      currentPositionRef.current = targetPosition
+      return
+    }
+
+    const startedAt = window.performance.now()
+    const animate = (now: number) => {
+      const rawProgress = Math.min(1, (now - startedAt) / trackedVehicleAnimationMs)
+      const easedProgress = 1 - Math.pow(1 - rawProgress, 3)
+      const next = interpolateLatLng(start, targetPosition, easedProgress)
+
+      marker.setLatLng([next.lat, next.lng])
+
+      if (rawProgress < 1) {
+        animationFrameRef.current = window.requestAnimationFrame(animate)
+      } else {
+        currentPositionRef.current = targetPosition
+        animationFrameRef.current = null
+      }
+    }
+
+    animationFrameRef.current = window.requestAnimationFrame(animate)
+
+    return () => {
+      if (animationFrameRef.current !== null) {
+        window.cancelAnimationFrame(animationFrameRef.current)
+        animationFrameRef.current = null
+      }
+    }
+  }, [targetPosition])
+
+  return null
+}
+
 function App() {
   const [selectedPosition, setSelectedPosition] = useState<LatLng>(nisCenter)
   const [allStations, setAllStations] = useState<Station[]>([])
@@ -161,6 +246,7 @@ function App() {
   const [stationsRadiusMeters, setStationsRadiusMeters] = useState(minStationsRadiusMeters)
   const hasInitialized = useRef(false)
   const hasAutoLocated = useRef(false)
+  const stationArrivalsRequestId = useRef(0)
 
   const nearbyStations = useMemo(() => {
     return allStations
@@ -172,14 +258,32 @@ function App() {
       .sort((a, b) => a.distanceMeters - b.distanceMeters)
   }, [allStations, selectedPosition, stationsRadiusMeters])
 
-  const filteredStations = useMemo(() => {
-    if (!searchTerm.trim()) {
-      return nearbyStations
+  const searchSuggestions = useMemo(() => {
+    const normalizedSearch = toLatin(searchTerm).toLowerCase()
+    if (!normalizedSearch.trim()) {
+      return []
     }
 
-    const normalizedSearch = toLatin(searchTerm).toLowerCase()
-    return nearbyStations.filter((station) => toLatin(station.name).toLowerCase().includes(normalizedSearch))
-  }, [nearbyStations, searchTerm])
+    return allStations
+      .map((station) => ({
+        ...station,
+        distanceMeters: distanceMeters(selectedPosition, { lat: station.latitude, lng: station.longitude }),
+      }))
+      .filter((station) => toLatin(station.name).toLowerCase().includes(normalizedSearch))
+      .sort((a, b) => {
+        const aName = toLatin(a.name).toLowerCase()
+        const bName = toLatin(b.name).toLowerCase()
+        const aStarts = aName.startsWith(normalizedSearch)
+        const bStarts = bName.startsWith(normalizedSearch)
+
+        if (aStarts !== bStarts) {
+          return aStarts ? -1 : 1
+        }
+
+        return a.distanceMeters - b.distanceMeters
+      })
+      .slice(0, maxSearchSuggestions)
+  }, [allStations, searchTerm, selectedPosition])
 
   const stationNameById = useMemo(() => {
     return allStations.reduce<Record<string, string>>((acc, station) => {
@@ -409,10 +513,11 @@ function App() {
     }
   }, [trackedVehicleId])
 
-  const selectStation = async (station: NearbyStation) => {
-    setSelectedStation(station)
-    setIsLoadingArrivals(true)
-    setError(null)
+  const loadStationArrivals = useCallback(async (station: NearbyStation, showLoading: boolean, showError: boolean) => {
+    const requestId = ++stationArrivalsRequestId.current
+    if (showLoading) {
+      setIsLoadingArrivals(true)
+    }
 
     try {
       const response = await fetch(`${apiBaseUrl}/api/v1/stations/${station.id}/arrivals`)
@@ -421,25 +526,82 @@ function App() {
       }
 
       const data = (await response.json()) as StationArrivalsResponse
+      if (requestId !== stationArrivalsRequestId.current) {
+        return
+      }
+
       setStationArrivals(data)
     } catch {
-      setError('Could not load arrivals for this station yet.')
-      setStationArrivals(null)
+      if (requestId === stationArrivalsRequestId.current && showError) {
+        setError('Could not load arrivals for this station yet.')
+        setStationArrivals(null)
+      }
     } finally {
-      setIsLoadingArrivals(false)
+      if (requestId === stationArrivalsRequestId.current && showLoading) {
+        setIsLoadingArrivals(false)
+      }
     }
+  }, [])
+
+  const selectStation = async (station: NearbyStation) => {
+    setSelectedStation(station)
+    setError(null)
+    await loadStationArrivals(station, true, true)
   }
+
+  const chooseSearchSuggestion = async (station: NearbyStation) => {
+    const next = clampToNis({ lat: station.latitude, lng: station.longitude })
+    setSearchTerm('')
+    setSelectedPosition(next)
+    await selectStation({
+      ...station,
+      distanceMeters: distanceMeters(next, { lat: station.latitude, lng: station.longitude }),
+    })
+  }
+
+  useEffect(() => {
+    if (!selectedStation) {
+      stationArrivalsRequestId.current++
+      setStationArrivals(null)
+      setIsLoadingArrivals(false)
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      void loadStationArrivals(selectedStation, false, false)
+    }, 3000)
+
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [loadStationArrivals, selectedStation])
 
   return (
     <div className="layout">
       <header className="topbar">
-        <input
-          className="search"
-          type="text"
-          placeholder="Search Nis stations"
-          value={searchTerm}
-          onChange={(event) => setSearchTerm(event.target.value)}
-        />
+        <div className="search-wrap">
+          <input
+            className="search"
+            type="text"
+            placeholder="Search Nis stations"
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+            autoComplete="off"
+          />
+
+          {searchSuggestions.length > 0 ? (
+            <ul className="search-suggestions">
+              {searchSuggestions.map((station) => (
+                <li key={station.id}>
+                  <button type="button" onClick={() => void chooseSearchSuggestion(station)}>
+                    <span>{station.name}</span>
+                    <small>{Math.round(station.distanceMeters)} m away</small>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
       </header>
 
       <main className="map-wrap">
@@ -476,7 +638,7 @@ function App() {
             <Popup>Your selected Nis position</Popup>
           </Marker>
 
-          {filteredStations.map((station) => (
+          {nearbyStations.map((station) => (
             <Marker
               key={station.id}
               position={[station.latitude, station.longitude]}
@@ -492,9 +654,7 @@ function App() {
           ))}
 
           {trackedVehicleId && trackedVehiclePosition ? (
-            <Marker position={[trackedVehiclePosition.lat, trackedVehiclePosition.lng]} icon={trackedVehicleIcon}>
-              <Popup>Tracking vehicle {trackedVehicleId}</Popup>
-            </Marker>
+            <SlidingVehicleMarker vehicleId={trackedVehicleId} targetPosition={trackedVehiclePosition} />
           ) : null}
         </MapContainer>
 
@@ -511,7 +671,7 @@ function App() {
         {!selectedStation ? (
           <section>
             <div className="range-row">
-              <h2>Nearby Stations ({filteredStations.length})</h2>
+              <h2>Nearby Stations ({nearbyStations.length})</h2>
               <div className="range-control">
                 <label htmlFor="rangeMeters">
                   Range: {stationsRadiusMeters >= 1000 ? `${(stationsRadiusMeters / 1000).toFixed(1)} km` : `${stationsRadiusMeters} m`}
@@ -530,7 +690,7 @@ function App() {
 
             {!isStationsReady || isLoadingStations ? <p>Loading stations...</p> : null}
             <ul className="station-list">
-              {filteredStations.map((station) => (
+              {nearbyStations.map((station) => (
                 <li key={station.id}>
                   <button type="button" className="station-item" onClick={() => void selectStation(station)}>
                     <span>{station.name}</span>

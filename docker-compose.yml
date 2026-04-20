@@ -8,6 +8,15 @@ services:
     volumes:
       - redis-data:/data
 
+  osrm:
+    image: osrm/osrm-backend:latest
+    container_name: transittracker-osrm
+    command: osrm-routed --algorithm mld /data/serbia-latest.osrm
+    ports:
+      - "${OSRM_PORT:-5001}:5000"
+    volumes:
+      - ./osrm-data:/data
+
   api:
     build:
       context: .
@@ -15,8 +24,13 @@ services:
     container_name: transittracker-api
     depends_on:
       - redis
+      - osrm
     environment:
       Redis__ConnectionString: ${REDIS_CONNECTION:-redis:6379}
+      Routing__UseOsrm: ${ROUTING_USE_OSRM:-true}
+      Routing__OsrmBaseUrl: ${ROUTING_OSRM_BASE_URL:-http://osrm:5000}
+      Routing__OsrmTimeoutSeconds: ${ROUTING_OSRM_TIMEOUT_SECONDS:-8}
+      Routing__WarmupOnStartup: ${ROUTING_WARMUP_ON_STARTUP:-true}
       ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
       ASPNETCORE_URLS: ${ASPNETCORE_URLS:-http://+:8080}
       Bootstrap__Enabled: ${BOOTSTRAP_ENABLED:-true}
@@ -24,6 +38,7 @@ services:
       Simulation__Enabled: ${SIMULATION_ENABLED:-true}
       Simulation__TickMs: ${SIMULATION_TICK_MS:-1000}
       Simulation__DwellMs: ${SIMULATION_DWELL_MS:-3000}
+      Simulation__MaxCatchUpMinutes: ${SIMULATION_MAX_CATCH_UP_MINUTES:-240}
     ports:
       - "${API_PORT:-5000}:8080"
 

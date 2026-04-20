@@ -38,6 +38,11 @@ public sealed class GtfsImportService : IGtfsImportService
     {
         var url = _configuration["Gtfs:NisUrl"] ?? DefaultNisGtfsUrl;
 
+        if (force)
+        {
+            await ResetDemoFleetAsync(cancellationToken);
+        }
+
         var client = _httpClientFactory.CreateClient();
         using var response = await client.GetAsync(url, cancellationToken);
         if (!response.IsSuccessStatusCode)
@@ -142,22 +147,32 @@ public sealed class GtfsImportService : IGtfsImportService
 
             if (force)
             {
-                var vehicleId = $"demo-{lineId.Replace(':', '-')}";
-                var vehicle = new Vehicle
+                var vehiclesPerDirection = DemoFleetPlanner.GetVehiclesPerDirection(route.RouteShortName);
+                for (var sequence = 1; sequence <= vehiclesPerDirection; sequence++)
                 {
-                    Id = vehicleId,
-                    LineId = line.Id,
-                    Type = route.RouteType == 0 ? VehicleType.Tram : VehicleType.Bus,
-                    IsActive = true
-                };
+                    var vehicleId = DemoFleetPlanner.BuildVehicleId(line.Id, sequence);
+                    var vehicle = new Vehicle
+                    {
+                        Id = vehicleId,
+                        LineId = line.Id,
+                        Type = route.RouteType == 0 ? VehicleType.Tram : VehicleType.Bus,
+                        IsActive = true
+                    };
 
-                await _redisService.SetAsync(RedisKeys.Vehicle(vehicleId), vehicle, null, cancellationToken);
-                await _redisService.SetAddAsync("active-vehicles", vehicleId, cancellationToken);
+                    await _redisService.SetAsync(RedisKeys.Vehicle(vehicleId), vehicle, null, cancellationToken);
+                    await _redisService.SetAddAsync("active-vehicles", vehicleId, cancellationToken);
 
-                var firstStation = stops[line.StationIds[0]];
-                await _geoService.AddLocationAsync(vehicleId, firstStation.Latitude, firstStation.Longitude, cancellationToken);
-                importedVehicles++;
+                    var firstStation = stops[line.StationIds[0]];
+                    await _geoService.AddLocationAsync(vehicleId, firstStation.Latitude, firstStation.Longitude, cancellationToken);
+
+                    importedVehicles++;
+                }
             }
+        }
+
+        if (force)
+        {
+            await _redisService.SetAsync("bootstrap:fleet-profile-version", DemoFleetPlanner.FleetProfileVersion, null, cancellationToken);
         }
 
         _logger.LogInformation("GTFS import done. Stations={Stations}, Lines={Lines}, Vehicles={Vehicles}, Url={Url}", importedStations, importedLines, importedVehicles, url);
@@ -173,6 +188,20 @@ public sealed class GtfsImportService : IGtfsImportService
     private static bool IsInNis(double latitude, double longitude)
     {
         return latitude >= 43.255 && latitude <= 43.39 && longitude >= 21.78 && longitude <= 22.02;
+    }
+
+    private async Task ResetDemoFleetAsync(CancellationToken cancellationToken)
+    {
+        var activeVehicleIds = await _redisService.SetMembersAsync("active-vehicles", cancellationToken);
+        foreach (var vehicleId in activeVehicleIds.Where(x => x.StartsWith("demo-gtfs-", StringComparison.OrdinalIgnoreCase)))
+        {
+            await _redisService.DeleteAsync(RedisKeys.Vehicle(vehicleId), cancellationToken);
+            await _redisService.DeleteAsync(RedisKeys.VehicleLocation(vehicleId), cancellationToken);
+            await _redisService.DeleteAsync(RedisKeys.SimulationVehicle(vehicleId), cancellationToken);
+        }
+
+        await _redisService.DeleteAsync("active-vehicles", cancellationToken);
+        await _redisService.DeleteAsync("vehicles", cancellationToken);
     }
 
     private static string ReadRequiredEntry(ZipArchive archive, string fileName)

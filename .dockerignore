@@ -7,4 +7,5 @@
 .dotnet/
 .nuget/
 .npm-cache/
+osrm-data/
 TransitTracker.Web/

@@ -13,19 +13,16 @@ public sealed class EtaWorker : BackgroundService
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly IRedisService _redisService;
-    private readonly IGeoService _geoService;
-    private readonly EtaCalculationService _etaCalculationService;
+    private readonly IEtaService _etaService;
     private readonly ILogger<EtaWorker> _logger;
 
     public EtaWorker(
         IRedisService redisService,
-        IGeoService geoService,
-        EtaCalculationService etaCalculationService,
+        IEtaService etaService,
         ILogger<EtaWorker> logger)
     {
         _redisService = redisService;
-        _geoService = geoService;
-        _etaCalculationService = etaCalculationService;
+        _etaService = etaService;
         _logger = logger;
     }
 
@@ -41,12 +38,6 @@ public sealed class EtaWorker : BackgroundService
                 {
                     var vehicleResult = await _redisService.GetAsync<Vehicle>(RedisKeys.Vehicle(vehicleId), stoppingToken);
                     if (!vehicleResult.IsSuccess || !vehicleResult.Value.IsActive)
-                    {
-                        continue;
-                    }
-
-                    var locationResult = await _geoService.GetLocationAsync(vehicleId, stoppingToken);
-                    if (!locationResult.IsSuccess)
                     {
                         continue;
                     }
@@ -77,19 +68,13 @@ public sealed class EtaWorker : BackgroundService
                             continue;
                         }
 
-                        var etaSeconds = _etaCalculationService.CalculateSeconds(locationResult.Value, station, vehicleResult.Value.Type);
-                        var eta = new EtaResult
-                        {
-                            VehicleId = vehicleId,
-                            StationId = stationId,
-                            EstimatedSeconds = etaSeconds
-                        };
+                        var eta = await _etaService.CalculateEtaAsync(vehicleId, stationId, stoppingToken);
 
                         var etaKey = RedisKeys.Eta(vehicleId, stationId);
                         await _redisService.HashSetFieldAsync(etaKey, "data", JsonSerializer.Serialize(eta, JsonOptions), stoppingToken);
                         await _redisService.KeyExpireAsync(etaKey, TimeSpan.FromSeconds(30), stoppingToken);
 
-                        _logger.LogInformation("ETA calculated for vehicle {VehicleId} and station {StationId}: {Seconds}s", vehicleId, stationId, etaSeconds);
+                        _logger.LogInformation("ETA calculated for vehicle {VehicleId} and station {StationId}: {Seconds}s", vehicleId, stationId, eta.EstimatedSeconds);
                     }
                 }
             }

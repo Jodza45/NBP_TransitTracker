@@ -21,6 +21,7 @@ public static class DependencyInjection
         services.AddSingleton<IStreamService, StreamService>();
         services.AddSingleton<IPubSubService, PubSubService>();
         services.AddSingleton<EtaCalculationService>();
+        services.AddSingleton<RouteGeometryService>();
         services.AddSingleton<IEtaService, EtaService>();
         services.AddSingleton<IGtfsImportService, GtfsImportService>();
 

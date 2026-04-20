@@ -5,6 +5,7 @@ using TransitTracker.Application.Common;
 using TransitTracker.Application.DTOs;
 using TransitTracker.Application.Interfaces;
 using TransitTracker.Domain.Models;
+using TransitTracker.Infrastructure.Redis;
 
 namespace TransitTracker.Infrastructure.Services;
 
@@ -25,7 +26,7 @@ public sealed class GeoService : IGeoService
         var db = _connectionMultiplexer.GetDatabase();
 
         await db.GeoAddAsync("vehicles", longitude, latitude, vehicleId);
-        await db.HashSetAsync($"vehicle-location:{vehicleId}",
+        await db.HashSetAsync(RedisKeys.VehicleLocation(vehicleId),
         [
             new HashEntry("lat", latitude.ToString(CultureInfo.InvariantCulture)),
             new HashEntry("lng", longitude.ToString(CultureInfo.InvariantCulture)),
@@ -46,7 +47,7 @@ public sealed class GeoService : IGeoService
             return Result<VehicleLocation>.Failure($"No geo position for vehicle '{vehicleId}'.");
         }
 
-        var details = await db.HashGetAllAsync($"vehicle-location:{vehicleId}");
+        var details = await db.HashGetAllAsync(RedisKeys.VehicleLocation(vehicleId));
         var timestamp = DateTimeOffset.UtcNow;
         if (details.Length > 0)
         {
