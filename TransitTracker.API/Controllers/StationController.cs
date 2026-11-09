@@ -376,6 +376,25 @@ public sealed class StationController : ControllerBase
 
             try
             {
+                var etaKey = RedisKeys.Eta(vehicleId, id);
+                var cachedEtaResult = await _redisService.HashGetAsync(etaKey, "data", cancellationToken);
+
+                if (cachedEtaResult.IsSuccess)
+                {
+                    var cachedEta = JsonSerializer.Deserialize<EtaResult>(cachedEtaResult.Value, JsonOptions);
+                    if (cachedEta != null)
+                    {
+                        arrivals.Add(new StationArrivalDto
+                        {
+                            VehicleId = vehicleId,
+                            LineId = vehicleResult.Value.LineId,
+                            EstimatedSeconds = cachedEta.EstimatedSeconds
+                        });
+                        continue;
+                    }
+                }
+
+                // Fallback na živo računanje ukoliko keš ne postoji ili je istekao
                 var eta = await _etaService.CalculateEtaAsync(vehicleId, id, cancellationToken);
                 arrivals.Add(new StationArrivalDto
                 {
